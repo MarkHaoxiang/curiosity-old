@@ -2,3 +2,5 @@ vmas
 torch
 torchrl
 pyyaml
+hydra-core
+tqdm

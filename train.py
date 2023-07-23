@@ -1,63 +1,191 @@
-import argparse
+# Configurations
+import hydra
+from omegaconf import DictConfig
 
 import torch
-from torchrl import envs
-import vmas
+from torchrl.envs import TransformedEnv, RewardSum
+from torchrl.envs.utils import set_exploration_type, ExplorationType
+from torchrl.envs.libs.vmas import VmasEnv
+from torchrl.modules import ProbabilisticActor, AdditiveGaussianWrapper, TanhDelta, ValueOperator
+from torchrl.collectors import SyncDataCollector
+from torchrl.data import TensorDictReplayBuffer
+from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
+from torchrl.data.replay_buffers.storages import LazyTensorStorage
+from tensordict.nn import TensorDictModule
+from torchrl.objectives import DDPGLoss, ValueEstimators
+from torchrl.record.loggers.utils import get_logger, generate_exp_name
 
-if __name__ == "__main__":
-    # Parameters
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--lr", dest="learning_rate",
-        type=float, default=3e-4,
-        help="learning rate"
-    )
-    parser.add_argument(
-        "--seed", dest="seed",
-        type=float, default=torch.seed(),
-        help="seed"
-    )
-    parser.add_argument(
-        "--frames_per_batch", dest="frames_per_batch",
-        type=int, default=100,
-        help="frames per batch"
-    )
-    parser.add_argument(
-        "--total_frames", dest="total_frames",
-        type=int, default=10000,
-        help="total number of frames"
-    )
-    parser.add_argument(
-        "--frame_skip", dest="frame_skip",
-        type=int, default=1,
-        help="frames to skip (repeat actions)"
-    )
-    parser.add_argument(
-        "--scenario", dest="scenario",
-        type=str, default='waterfall',
-        help="environment scenario"
-    )
-    args = parser.parse_args()
-    args.frames_per_batch = args.frames_per_batch // args.frame_skip
-    args.total_frames = args.total_frames // args.frame_skip
+from tqdm import tqdm
 
-    # Torch Setup
-    device = "cpu" if not torch.has_cuda else "cuda:0"
-    torch.manual_seed(args.seed)
+from models.MultiAgentMLP import MultiAgentMLP
+from utils.logging import log_evaluation
+# Derived from
+# https://github.com/pytorch/rl/pull/1027
 
-    # Environment Setup
-    base_env = vmas.make_env(
-        scenario=args.scenario,
-        num_envs=32,
-        device=device,
-        continuous_actions=True,
-        max_steps=args.total_frames,
-        seed=args.seed,
-        dict_spaces=True
+@hydra.main(version_base=None, config_path="conf", config_name="maddpg")
+def train(cfg: "DictConfig"):
+    # General setup
+    cfg.train.device = "cpu" if not torch.backends.cuda.is_built() else "cuda:0"
+    cfg.env.device = cfg.train.device
+
+    # Seeding
+    torch.manual_seed(cfg.seed)
+    
+    # Sampling
+    cfg.env.num_envs = cfg.collector.frames_per_batch // cfg.env.max_steps
+    cfg.collector.total_frames = cfg.collector.frames_per_batch * cfg.collector.n_iters
+    cfg.buffer.memory_size = cfg.collector.frames_per_batch
+
+    # Create env and test
+    env = VmasEnv(scenario=cfg.env.scenario_name,
+                  num_envs=cfg.env.num_envs,
+                  continuous_actions=True,
+                  max_steps=cfg.env.max_steps,
+                  device=cfg.train.device,
+                  seed=cfg.seed,
+                  **cfg.env.scenario)
+
+    env_eval = VmasEnv(scenario=cfg.env.scenario_name,
+                       num_envs=cfg.eval.evaluation_episodes,
+                       continuous_actions=True,
+                       max_steps=cfg.env.max_steps,
+                       device=cfg.train.device,
+                       seed=cfg.seed,
+                       **cfg.env.scenario) 
+
+    env = TransformedEnv(env,
+                         RewardSum(in_keys=[env.reward_key],
+                                   out_keys=[("agents","episode_reward")]
+                                   )
     )
-    env = envs.TransformedEnv(env=base_env, transform = envs.Compose(
-        envs.FrameSkipTransform(args.frame_skip),
-        None))
     # Policy
-    policy = None # TODO
+    policy_network = MultiAgentMLP(n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
+                                   n_agent_outputs=env.action_spec.shape[-1],
+                                   n_agents=env.n_agents,
+                                   centralised=cfg.model.centralised,
+                                   share_params=cfg.model.shared_parameters,
+                                   device=cfg.train.device,
+                                   depth=cfg.model.depth,
+                                   num_cells=cfg.model.num_cell
+    )
+    policy_module = TensorDictModule(policy_network,
+                                     in_keys=[("agents", "observation")],
+                                     out_keys=[("agents", "param")]
+    )
 
+    policy = ProbabilisticActor(module=policy_module,
+                                spec=env.unbatched_action_spec,
+                                in_keys=[("agents", "param")],
+                                out_keys=[env.action_key],
+                                distribution_class = TanhDelta,
+                                distribution_kwargs={
+                                    "min": env.unbatched_action_spec[("agents", "action")].space.minimum,
+                                    "max": env.unbatched_action_spec[("agents", "action")].space.maximum
+                                },
+                                return_log_prob=False
+    )
+
+    exploration_module = AdditiveGaussianWrapper(
+        policy,
+        annealing_num_steps=int(cfg.collector.total_frames * 0.5),
+        action_key=env.action_key
+    )
+
+    # Critic
+    critic_network = MultiAgentMLP(n_agent_inputs=env.observation_spec[("agents", "observation")].shape[-1]
+                                        + env.action_spec.shape[-1], # Q critic
+                                   n_agent_outputs=1,
+                                   n_agents=env.n_agents,
+                                   centralised=cfg.model.centralised,
+                                   share_params=cfg.model.shared_parameters,
+                                   device=cfg.train.device,
+                                   depth=cfg.model.depth,
+                                   num_cells=cfg.model.num_cell
+    )
+    
+    value_module = ValueOperator(module=critic_network,
+                                 in_keys=[("agents", "observation"), env.action_key],
+                                 out_keys=[("agents","state_action_value")]
+    )
+
+    # Data
+    collector = SyncDataCollector(env,
+                                  exploration_module,
+                                  device=cfg.env.device,
+                                  storing_device = cfg.train.device,
+                                  frames_per_batch=cfg.collector.frames_per_batch,
+                                  total_frames=cfg.collector.total_frames
+    )
+
+    replay_buffer = TensorDictReplayBuffer(storage=LazyTensorStorage(max_size=cfg.buffer.memory_size,
+                                                                     device=cfg.train.device),
+                                           sampler=SamplerWithoutReplacement(),
+                                           batch_size=cfg.train.minibatch_size
+    )
+
+    
+    # Train
+    loss_module = DDPGLoss(actor_network=policy,
+                           value_network=value_module
+    )
+    loss_module.set_keys(state_action_value=("agents", "state_action_value"),
+                         reward=env.reward_key)
+    loss_module.make_value_estimator(ValueEstimators.TD0, gamma=cfg.loss.gamma)
+
+    optim = torch.optim.Adam(loss_module.parameters(), cfg.train.lr)
+
+    # Logging
+    model_name = "Testing-MADDPG"
+    logger = get_logger(experiment_name=generate_exp_name(cfg.env.scenario_name, model_name),
+                        logger_name="logs",
+                        logger_type="wandb"
+    )
+
+    # Training Loop
+    print("Initialization complete. Begin training.")
+
+    for i, tensordict_data in tqdm(enumerate(collector)):
+        tensordict_data.set(key=("next","done"),
+                            item=tensordict_data.get(("next", "done"))
+                            .unsqueeze(-1)
+                            .expand(tensordict_data.get(("next", env.reward_key)).shape)
+        )
+
+        data_view = tensordict_data.reshape(-1)
+        replay_buffer.extend(data_view)
+
+        for _ in range(cfg.train.num_epochs):
+            for _ in range(cfg.collector.frames_per_batch // cfg.train.minibatch_size):
+                # Sample
+                minibatch = replay_buffer.sample()
+
+                # Calculate Loss
+                loss_values = loss_module(minibatch)
+                loss_value = loss_values["loss_actor"] + loss_values["loss_value"]
+                loss_value.backward()
+
+                # Keep gradient norm bounded
+                torch.nn.utils.clip_grad_norm_(loss_module.parameters(), cfg.train.max_grad_norm)
+
+                # Step
+                optim.step()
+                optim.zero_grad()
+
+        # Logging
+        if i % cfg.eval.evaluation_interval == 0:
+            with torch.no_grad() and set_exploration_type(ExplorationType.MEAN):
+                env_eval.frames = []
+                rollouts = env_eval.rollout(max_steps=cfg.env.max_steps,
+                                            policy=policy,
+                                            callback=rendering_callback,
+                                            auto_cast_to_device=True,
+                                            break_when_any_done=False
+                )
+                log_evaluation(logger, rollouts, env_eval, loss_value, i)
+
+
+def rendering_callback(env, td):
+    env.frames.append(env.render(mode="rgb_array", agent_index_focus=None))
+
+if __name__=="__main__":
+    train()
