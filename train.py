@@ -138,7 +138,7 @@ def train(cfg: "DictConfig"):
     model_name = "Testing-MADDPG"
     logger = get_logger(experiment_name=generate_exp_name(cfg.env.scenario_name, model_name),
                         logger_name="logs",
-                        logger_type="wandb"
+                        logger_type=cfg.logger.backend
     )
 
     # Training Loop
