@@ -3,7 +3,7 @@ import hydra
 from omegaconf import DictConfig
 
 import torch
-from torchrl.envs import TransformedEnv, RewardSum
+from torchrl.envs import Compose, TransformedEnv, RewardSum
 from torchrl.envs.utils import set_exploration_type, ExplorationType
 from torchrl.envs.libs.vmas import VmasEnv
 from torchrl.modules import ProbabilisticActor, AdditiveGaussianWrapper, TanhDelta, ValueOperator
@@ -18,6 +18,7 @@ from torchrl.record.loggers.utils import get_logger, generate_exp_name
 from tqdm import tqdm
 
 from models.MultiAgentMLP import MultiAgentMLP
+from models.ICM import IntrinsicCuriosityLoss, IntrinsicCuriosityReward, InverseModel
 from utils.logging import log_evaluation
 # Derived from
 # https://github.com/pytorch/rl/pull/1027
@@ -52,11 +53,48 @@ def train(cfg: "DictConfig"):
                        device=cfg.train.device,
                        seed=cfg.seed,
                        **cfg.env.scenario) 
+    
+        # Curiosity
+    feature_model = MultiAgentMLP(n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
+                                  n_agent_outputs=cfg.curiosity.encoding_size,
+                                  n_agents=env.n_agents,
+                                  centralised=True,
+                                  share_params=True,
+                                  device=cfg.train.device)
 
-    env = TransformedEnv(env,
-                         RewardSum(in_keys=[env.reward_key],
-                                   out_keys=[("agents","episode_reward")]
-                                   )
+    forward_model = MultiAgentMLP(n_agent_inputs=cfg.curiosity.encoding_size + env.action_spec.shape[-1],
+                                  n_agent_outputs=cfg.curiosity.encoding_size,
+                                  n_agents=env.n_agents,
+                                  centralised=True,
+                                  share_params=True,
+                                  device=cfg.train.device)
+    
+    inverse_model = MultiAgentMLP(n_agent_inputs=cfg.curiosity.encoding_size * 2,
+                                  n_agent_outputs=env.action_spec.shape[-1],
+                                  n_agents=env.n_agents,
+                                  centralised=True,
+                                  share_params=True,
+                                  device=cfg.train.device)
+    inverse_model = InverseModel(feature_network=feature_model,
+                                 inverse_network=inverse_model) 
+
+    env = TransformedEnv(
+        env,
+        Compose(
+            IntrinsicCuriosityReward(
+                forward_model=forward_model,
+                feature_model=feature_model,
+                encoding_size=cfg.curiosity.encoding_size,
+                n_agents=env.n_agents,
+                reward_key=env.reward_key,
+                action_key=env.action_key,
+                observation_key=("agents","observation")
+            ),
+            RewardSum(
+                in_keys=[env.reward_key],
+                out_keys=[("agents","episode_reward")]
+            )
+        )
     )
     # Policy
     policy_network = MultiAgentMLP(n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
@@ -131,15 +169,21 @@ def train(cfg: "DictConfig"):
     loss_module.set_keys(state_action_value=("agents", "state_action_value"),
                          reward=env.reward_key)
     loss_module.make_value_estimator(ValueEstimators.TD0, gamma=cfg.loss.gamma)
-
+    
+    loss_curiosity = IntrinsicCuriosityLoss(forward_model=forward_model,
+                                            inverse_model=inverse_model,
+                                            feature_model=feature_model)
+    
     optim = torch.optim.Adam(loss_module.parameters(), cfg.train.lr)
+    optim_curiosity = torch.optim.Adam(loss_curiosity.parameters(), cfg.train.lr)
 
     # Logging
-    model_name = "Testing-MADDPG"
-    logger = get_logger(experiment_name=generate_exp_name(cfg.env.scenario_name, model_name),
-                        logger_name="logs",
-                        logger_type=cfg.logger.backend
-    )
+    if cfg.logger.enable:
+        model_name = "Testing-MADDPG"
+        logger = get_logger(experiment_name=generate_exp_name(cfg.env.scenario_name, model_name),
+                            logger_name="logs",
+                            logger_type=cfg.logger.backend
+        )
 
     # Training Loop
     print("Initialization complete. Begin training.")
@@ -164,15 +208,21 @@ def train(cfg: "DictConfig"):
                 loss_value = loss_values["loss_actor"] + loss_values["loss_value"]
                 loss_value.backward()
 
+                loss_curiosity_values = loss_curiosity(minibatch)
+                loss_curiosity_values = loss_curiosity_values["loss_forward"] + loss_curiosity_values["loss_inverse"]
+                loss_curiosity_values.backward()
+
                 # Keep gradient norm bounded
                 torch.nn.utils.clip_grad_norm_(loss_module.parameters(), cfg.train.max_grad_norm)
 
                 # Step
                 optim.step()
                 optim.zero_grad()
+                optim_curiosity.step()
+                optim_curiosity.zero_grad()
 
         # Logging
-        if i % cfg.eval.evaluation_interval == 0:
+        if cfg.logger.enable and i % cfg.eval.evaluation_interval == 0:
             with torch.no_grad() and set_exploration_type(ExplorationType.MEAN):
                 env_eval.frames = []
                 rollouts = env_eval.rollout(max_steps=cfg.env.max_steps,

@@ -26,6 +26,9 @@ loss:
   gamma: 0.9
   tau: 0.005 # For target net
 
+curiosity:
+  encoding_size: 8
+
 train:
   num_epochs: 45  # optimization steps per batch of data collected
   minibatch_size: 4096 # size of minibatches used in each epoch
@@ -38,4 +41,5 @@ eval:
   evaluation_episodes: 200
 
 logger:
+  enable: False
   backend:  wandb 

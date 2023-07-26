@@ -4,10 +4,12 @@ from typing import Optional
 
 import torch
 from torch.nn import Module
+from torchrl.data.tensor_specs import TensorSpec
 from torchrl.envs.transforms import Transform
 from tensordict.utils import NestedKey
 from tensordict import TensorDictBase, TensorDict
 from torchrl.objectives.common import LossModule
+from torchrl.data.tensor_specs import CompositeSpec, UnboundedContinuousTensorSpec
 
 
 # TODO
@@ -38,21 +40,28 @@ class IntrinsicCuriosityReward(Transform):
         reward_key
         action_key
         observation_key
+        out_key = Where put the new, combined reward
     """
 
     def __init__(self,
                  feature_model: Module,
                  forward_model: Module,
+                 encoding_size: int,
+                 n_agents: int,
                  reward_key: NestedKey = "reward",
                  action_key: NestedKey = "action",
                  observation_key: NestedKey = "observation",
                  out_key: Optional[NestedKey] = None):
+        out_key = reward_key if out_key is None else out_key
+        super().__init__(in_keys=[reward_key, action_key, observation_key], out_keys=[out_key])
         self._feature_model = feature_model
         self._forward_model = forward_model
         self._reward_key = reward_key
         self._action_key = action_key
         self._observation_key = observation_key
-        self.out_key = self._reward_key if out_key is None else out_key
+        self._out_key = out_key
+        self._encoding_size = encoding_size
+        self._n_agents = n_agents
 
         self.previous_state = None
 
@@ -78,7 +87,7 @@ class IntrinsicCuriosityReward(Transform):
 
         # Set the new rewards
         r = r + torch.linalg.vector_norm(phi_1-phi_1_pred)
-        tensordict['next'].set(self.out_key, r)
+        tensordict['next'].set(self._out_key, r)
         self.previous_state = tensordict
 
         # Set the training targets for IntrinsicCuriosityLoss
@@ -94,6 +103,37 @@ class IntrinsicCuriosityReward(Transform):
     def _call(self, tensordict: TensorDictBase):
         # Called in reset
         return tensordict
+    
+    def transform_observation_spec(self, observation_spec: TensorSpec) -> TensorSpec:
+        icm_spec = {}
+
+        phi_0 = UnboundedContinuousTensorSpec(
+            shape = (*self.parent.batch_size, self._n_agents, self._encoding_size),
+            device = self.parent.device
+        )
+        phi_1 = UnboundedContinuousTensorSpec(
+            shape = (*self.parent.batch_size, self._n_agents, self._encoding_size),
+            device = self.parent.device
+        )
+        icm_spec.update({
+            "ICM":CompositeSpec(
+                a_0 = self.parent.action_spec,
+                s_0 = observation_spec.clone(),
+                s_1 = observation_spec.clone(),
+                phi_0 = phi_0,
+                phi_1 = phi_1,
+                shape = self.parent.batch_size
+            )
+        })
+
+        # Add new specs
+        if not isinstance(observation_spec, CompositeSpec):
+            observation_spec = CompositeSpec(
+                observation=observation_spec, shape=self.parent.batch_size
+            )
+        observation_spec.update(icm_spec)
+
+        return observation_spec
 
 class IntrinsicCuriosityLoss(LossModule):
     """ Intrinsic Curiosity Model
@@ -105,25 +145,59 @@ class IntrinsicCuriosityLoss(LossModule):
                  forward_model: Module,
                  inverse_model: Module,
                  feature_model: Module):
+        super().__init__()
+
+        self.convert_to_functional(
+            forward_model,
+            "forward_model",
+            create_target_params=False,
+        )
+
+        self.convert_to_functional(
+            inverse_model,
+            "inverse_model",
+            create_target_params=False,
+        )
+        self.convert_to_functional(
+            feature_model,
+            "feature_model",
+            create_target_params=False,
+        )
+
         self.forward_model = forward_model
         self.inverse_model = inverse_model
-        self.feature_model = feature_model # TODO: Feature model should really be a part of inverse model. 
-                                           # Will refactor on the TensorDict Module refactor
-        
+        self.feature_model = feature_model
 
-    def _forward(self, tensordict: TensorDictBase):
+    def forward(self, tensordict: TensorDictBase):
         # Inverse loss
-        s_0 = tensordict[("ICM", "s_0")]
-        s_1 = tensordict[("ICM", "s_1")]
+        # print(tensordict["ICM", "s_0", "agents", "observation"].shape)
+        s_0 = tensordict[("ICM", "s_0", "agents", "observation")]
+        s_1 = tensordict[("ICM", "s_1", "agents", "observation")] # TODO (bug)
         a_0 = tensordict[("ICM", "a_0")]
-        loss_inverse = self.inverse_model(torch.cat((s_0, s_1), dim=-1)) - a_0
+        loss_inverse = self.inverse_model(s_0, s_1) - a_0
 
         phi_0 = self.feature_model(s_0)
-        loss_forward = self.forward_model(torch.cat(a_0, phi_0), dim=-1)
+        loss_forward = self.forward_model(torch.cat((a_0, phi_0),dim=-1))
 
         return TensorDict(
             source={
                 "loss_inverse": loss_inverse.mean(),
                 "loss_forward": loss_forward.mean()
-            }
+            },
+            batch_size=[]
         )
+
+
+class InverseModel(Module):
+    def __init__(self,
+                 feature_network,
+                 inverse_network):
+        super().__init__()
+        self._feature_network = feature_network
+        self._inverse_network = inverse_network
+
+    def forward(self, s_0, s_1):
+        phi_0 = self._feature_network(s_0)
+        phi_1 = self._feature_network(s_1)
+        a     = self._inverse_network(torch.cat((phi_0, phi_1), dim=-1))
+        return a
