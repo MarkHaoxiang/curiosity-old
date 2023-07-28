@@ -88,7 +88,8 @@ def train(cfg: "DictConfig"):
                 n_agents=env.n_agents,
                 reward_key=env.reward_key,
                 action_key=env.action_key,
-                observation_key=("agents","observation")
+                observation_key=("agents","observation"),
+                weighting = cfg.curiosity.weighting
             ),
             RewardSum(
                 in_keys=[env.reward_key],

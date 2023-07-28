@@ -51,7 +51,8 @@ class IntrinsicCuriosityReward(Transform):
                  reward_key: NestedKey = "reward",
                  action_key: NestedKey = "action",
                  observation_key: NestedKey = "observation",
-                 out_key: Optional[NestedKey] = None):
+                 out_key: Optional[NestedKey] = None,
+                 weighting = 1):
         out_key = reward_key if out_key is None else out_key
         super().__init__(in_keys=[reward_key, action_key, observation_key], out_keys=[out_key])
         self._feature_model = feature_model
@@ -62,6 +63,7 @@ class IntrinsicCuriosityReward(Transform):
         self._out_key = out_key
         self._encoding_size = encoding_size
         self._n_agents = n_agents
+        self._w = weighting
 
         self.previous_state = None
 
@@ -86,12 +88,13 @@ class IntrinsicCuriosityReward(Transform):
             phi_1_pred = self._forward_model(torch.cat((a_0, phi_0), dim=-1))
 
         # Set the new rewards
-        r = r + torch.linalg.vector_norm(phi_1-phi_1_pred)
+        r = r + torch.linalg.vector_norm(phi_1-phi_1_pred) * self._w
         tensordict['next'].set(self._out_key, r)
         self.previous_state = tensordict
 
         # Set the training targets for IntrinsicCuriosityLoss
         # And for debugging
+
         tensordict['next'].set(("ICM", "a_0"), a_0)
         tensordict['next'].set(("ICM", "s_0"), s_0)
         tensordict['next'].set(("ICM", "s_1"), s_1)
@@ -115,11 +118,12 @@ class IntrinsicCuriosityReward(Transform):
             shape = (*self.parent.batch_size, self._n_agents, self._encoding_size),
             device = self.parent.device
         )
+
         icm_spec.update({
             "ICM":CompositeSpec(
                 a_0 = self.parent.action_spec,
-                s_0 = observation_spec.clone(),
-                s_1 = observation_spec.clone(),
+                s_0 = observation_spec[self._observation_key],
+                s_1 = observation_spec[self._observation_key],
                 phi_0 = phi_0,
                 phi_1 = phi_1,
                 shape = self.parent.batch_size
@@ -170,9 +174,8 @@ class IntrinsicCuriosityLoss(LossModule):
 
     def forward(self, tensordict: TensorDictBase):
         # Inverse loss
-        # print(tensordict["ICM", "s_0", "agents", "observation"].shape)
-        s_0 = tensordict[("ICM", "s_0", "agents", "observation")]
-        s_1 = tensordict[("ICM", "s_1", "agents", "observation")] # TODO (bug)
+        s_0 = tensordict[("ICM", "s_0")]
+        s_1 = tensordict[("ICM", "s_1")]
         a_0 = tensordict[("ICM", "a_0")]
         loss_inverse = self.inverse_model(s_0, s_1) - a_0
 
@@ -186,7 +189,6 @@ class IntrinsicCuriosityLoss(LossModule):
             },
             batch_size=[]
         )
-
 
 class InverseModel(Module):
     def __init__(self,
