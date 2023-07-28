@@ -212,7 +212,6 @@ def train(cfg: "DictConfig"):
                 loss_curiosity_values = loss_curiosity(minibatch)
                 loss_curiosity_values = loss_curiosity_values["loss_forward"] + loss_curiosity_values["loss_inverse"]
                 loss_curiosity_values.backward()
-
                 # Keep gradient norm bounded
                 torch.nn.utils.clip_grad_norm_(loss_module.parameters(), cfg.train.max_grad_norm)
 

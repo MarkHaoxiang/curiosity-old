@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-from torch.nn import Module
+from torch.nn import Module, MSELoss
 from torchrl.data.tensor_specs import TensorSpec
 from torchrl.envs.transforms import Transform
 from tensordict.utils import NestedKey
@@ -177,10 +177,12 @@ class IntrinsicCuriosityLoss(LossModule):
         s_0 = tensordict[("ICM", "s_0")]
         s_1 = tensordict[("ICM", "s_1")]
         a_0 = tensordict[("ICM", "a_0")]
-        loss_inverse = self.inverse_model(s_0, s_1) - a_0
+
+        loss_inverse = (self.inverse_model(s_0, s_1) - a_0) ** 2
 
         phi_0 = self.feature_model(s_0)
-        loss_forward = self.forward_model(torch.cat((a_0, phi_0),dim=-1))
+        phi_1 = self.feature_model(s_1)
+        loss_forward = (self.forward_model(torch.cat((a_0, phi_0),dim=-1)) - phi_1) ** 2
 
         return TensorDict(
             source={

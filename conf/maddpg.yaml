@@ -42,5 +42,5 @@ eval:
   evaluation_episodes: 200
 
 logger:
-  enable: True
+  enable: False
   backend:  wandb 
