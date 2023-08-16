@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-from torch.nn import Module, MSELoss
+from torch.nn import Module
 from torchrl.data.tensor_specs import TensorSpec
 from torchrl.envs.transforms import Transform
 from tensordict.utils import NestedKey
@@ -47,7 +47,8 @@ class IntrinsicCuriosityReward(Transform):
                  feature_model: Module,
                  forward_model: Module,
                  encoding_size: int,
-                 n_agents: int,
+                 n_agents: Optional[int] = None,
+                 multiagent: bool=False,
                  reward_key: NestedKey = "reward",
                  action_key: NestedKey = "action",
                  observation_key: NestedKey = "observation",
@@ -63,20 +64,17 @@ class IntrinsicCuriosityReward(Transform):
         self._out_key = out_key
         self._encoding_size = encoding_size
         self._n_agents = n_agents
+        self._multiagent = multiagent
         self._w = weighting
 
         self.previous_state = None
 
     def reset(self, tensordict: TensorDictBase) -> TensorDictBase:
         """Resets a tranform if it is stateful."""
-        self.previous_state = None
+        self.previous_state = tensordict
         return tensordict
 
     def _step(self, tensordict: TensorDictBase):
-        if self.previous_state == None:
-            self.previous_state = tensordict
-            return tensordict
-
         a_0 = tensordict[self._action_key]
         s_0, s_1 = self.previous_state[self._observation_key], tensordict['next'][self._observation_key]
         r = tensordict['next'][self._reward_key]
@@ -110,12 +108,17 @@ class IntrinsicCuriosityReward(Transform):
     def transform_observation_spec(self, observation_spec: TensorSpec) -> TensorSpec:
         icm_spec = {}
 
+        if self._multiagent:
+            shape = (*self.parent.batch_size, self._n_agents, self._encoding_size)
+        else:
+            shape = (*self.parent.batch_size, self._encoding_size)
+
         phi_0 = UnboundedContinuousTensorSpec(
-            shape = (*self.parent.batch_size, self._n_agents, self._encoding_size),
+            shape = shape,
             device = self.parent.device
         )
         phi_1 = UnboundedContinuousTensorSpec(
-            shape = (*self.parent.batch_size, self._n_agents, self._encoding_size),
+            shape = shape,
             device = self.parent.device
         )
 

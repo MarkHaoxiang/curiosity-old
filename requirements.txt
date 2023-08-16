@@ -1,6 +1,11 @@
-vmas
 torch
 torchrl
 pyyaml
 hydra-core
 tqdm
+
+vmas
+gym
+atari-py
+ale-py
+pygame

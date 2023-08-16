@@ -1,219 +1,297 @@
+# Runs a Gym environment with PPO and optionally intrinsic curiosity loss
+
 # Configurations
 import hydra
 from omegaconf import DictConfig
+from tqdm import tqdm
 
+
+from tensordict.nn import TensorDictModule, NormalParamExtractor
 import torch
-from torchrl.envs import Compose, TransformedEnv, RewardSum
-from torchrl.envs.utils import set_exploration_type, ExplorationType
-from torchrl.envs.libs.vmas import VmasEnv
-from torchrl.modules import ProbabilisticActor, AdditiveGaussianWrapper, TanhDelta, ValueOperator
-from torchrl.collectors import SyncDataCollector
+from torch.optim import Adam
+from torch import nn
+from torchrl.data.tensor_specs import DiscreteBox
+from torchrl.envs.libs.gym import GymEnv
 from torchrl.data import TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
-from tensordict.nn import TensorDictModule
-from torchrl.objectives import DDPGLoss, ValueEstimators
+from torchrl.collectors import SyncDataCollector
+from torchrl.objectives import ClipPPOLoss
+from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers.utils import get_logger, generate_exp_name
-
+from torchrl.envs import (
+    TransformedEnv,
+    Compose,
+    RewardSum,
+    NoopResetEnv,
+    ExplorationType,
+    set_exploration_type,
+    check_env_specs
+)
+from torchrl.modules import (
+    MLP,
+    ConvNet,
+    OneHotCategorical,
+    TanhNormal,
+    ValueOperator,
+    ProbabilisticActor
+)
 from tqdm import tqdm
 
-from models.MultiAgentMLP import MultiAgentMLP
 from models.ICM import IntrinsicCuriosityLoss, IntrinsicCuriosityReward, InverseModel
-from utils.logging import log_evaluation
-# Derived from
-# https://github.com/pytorch/rl/pull/1027
+from utils.logging import log_evaluation, log_training
 
-@hydra.main(version_base=None, config_path="conf", config_name="maddpg")
+def build_curiosity(env, cfg):
+    n_features = env.observation_spec['observation'].shape[0]
+    n_actions = env.action_spec.shape[-1]
+    feature_net = MLP(
+        in_features=n_features,
+        out_features=cfg.curiosity.encoding_size,
+        num_cells=cfg.model.num_cell,
+        depth = cfg.model.depth // 2 + cfg.model.depth % 2,
+        activation_class=nn.Tanh,
+        activate_last_layer=True,
+        device=cfg.train.device
+    )
+
+    forward_net = MLP(
+        in_features=cfg.curiosity.encoding_size + n_actions,
+        depth=cfg.model.depth // 2,
+        out_features=cfg.curiosity.encoding_size,
+        device=cfg.train.device        
+    )
+
+
+    inverse_head = MLP(
+        in_features=cfg.curiosity.encoding_size * 2,
+        depth=cfg.model.depth // 2,
+        out_features=n_actions,
+        device=cfg.train.device
+    )
+
+    inverse_net = InverseModel(
+        feature_network=feature_net,
+        inverse_network=inverse_head
+    )
+
+    curiosity_transform = IntrinsicCuriosityReward(
+        forward_model=forward_net,
+        feature_model=feature_net,
+        encoding_size=cfg.curiosity.encoding_size,
+        multiagent=False,
+        reward_key=env.reward_key,
+        action_key=env.action_key,
+        weighting=cfg.curiosity.weighting
+    )
+
+    curiosity_loss = IntrinsicCuriosityLoss(
+        forward_model=forward_net,
+        inverse_model=inverse_net,
+        feature_model=feature_net
+    )
+
+    return curiosity_transform, curiosity_loss
+
+def build_models(env, cfg):
+    n_features = env.observation_spec['observation'].shape[0]
+    if isinstance(env.action_spec.space, DiscreteBox):
+        continuous_actions = False
+        n_actions = env.action_spec.shape[-1]
+        distribution_class = OneHotCategorical
+        distribution_kwargs = {}
+    else:
+        continuous_actions = True
+        n_actions = env.action_spec.shape[-1] * 2
+        distribution_class = TanhNormal
+        distribution_kwargs = {
+            "min": env.action_spec.space.minimum,
+            "max": env.action_spec.space.maximum,
+            "tanh_loc": False,
+        }
+
+    common_net = MLP(
+        in_features = n_features,
+        out_features = cfg.model.num_cell,
+        num_cells=cfg.model.num_cell,
+        depth = cfg.model.depth // 2 + cfg.model.depth % 2,
+        activation_class=nn.Tanh,
+        activate_last_layer=True,
+        device=cfg.train.device
+    )
+
+    policy_head = MLP(
+        in_features = cfg.model.num_cell,
+        out_features = n_actions,
+        num_cells=cfg.model.num_cell,
+        depth = cfg.model.depth // 2,
+        activation_class=nn.Tanh,
+        activate_last_layer=False,
+        device=cfg.train.device
+    )
+
+    if continuous_actions:
+        policy_net = nn.Sequential(
+            common_net,
+            policy_head,
+            NormalParamExtractor()
+        )
+    else:
+        policy_net = nn.Sequential(
+            common_net,
+            policy_head
+        )
+
+    policy_module = TensorDictModule(
+        module=policy_net,
+        in_keys=['observation'],
+        out_keys=["loc", "scale"] if continuous_actions else ['logits']
+    )
+
+    policy_module = ProbabilisticActor(
+        module=policy_module,
+        in_keys=["loc", "scale"] if continuous_actions else ['logits'],
+        out_keys=[env.action_key],
+        spec=env.action_spec,
+        distribution_class=distribution_class,
+        distribution_kwargs=distribution_kwargs,
+        return_log_prob=True,
+        default_interaction_type=ExplorationType.RANDOM
+    )
+
+    value_head = MLP(
+        in_features = cfg.model.num_cell,
+        out_features = 1,
+        num_cells=cfg.model.num_cell,
+        depth = cfg.model.depth // 2,
+        activation_class=nn.Tanh,
+        activate_last_layer=False,
+        device=cfg.train.device
+    )
+
+    value_net = nn.Sequential(
+        common_net,
+        value_head
+    )
+    
+    value_module = ValueOperator(
+        module=value_net,
+        in_keys=['observation']
+    )
+
+    return policy_module, value_module
+
+
+@hydra.main(version_base=None, config_path="conf", config_name="ppo")
 def train(cfg: "DictConfig"):
     # General setup
     cfg.train.device = "cpu" if not torch.backends.cuda.is_built() else "cuda:0"
-    cfg.env.device = cfg.train.device
 
     # Seeding
     torch.manual_seed(cfg.seed)
     
-    # Sampling
-    cfg.env.num_envs = cfg.collector.frames_per_batch // cfg.env.max_steps
-    cfg.collector.total_frames = cfg.collector.frames_per_batch * cfg.collector.n_iters
-    cfg.buffer.memory_size = cfg.collector.frames_per_batch
+    # Metadata
+    cfg.collector.total_frames = cfg.collector.frames_per_batch * cfg.collector.n_iters // cfg.env.frame_skip
+    cfg.buffer.memory_size = cfg.collector.frames_per_batch = cfg.collector.frames_per_batch // cfg.env.frame_skip
 
     # Create env and test
-    env = VmasEnv(scenario=cfg.env.scenario_name,
-                  num_envs=cfg.env.num_envs,
-                  continuous_actions=True,
-                  max_steps=cfg.env.max_steps,
-                  device=cfg.train.device,
-                  seed=cfg.seed,
-                  **cfg.env.scenario)
-
-    env_eval = VmasEnv(scenario=cfg.env.scenario_name,
-                       num_envs=cfg.eval.evaluation_episodes,
-                       continuous_actions=True,
-                       max_steps=cfg.env.max_steps,
-                       device=cfg.train.device,
-                       seed=cfg.seed,
-                       **cfg.env.scenario) 
+    env = GymEnv(env_name=cfg.env.env_name, frame_skip=cfg.env.frame_skip, device=cfg.train.device)
+    env_eval = GymEnv(env_name=cfg.env.env_name, frame_skip=cfg.env.frame_skip, device=cfg.train.device, render_mode='rgb_array')
     
-        # Curiosity
-    feature_model = MultiAgentMLP(n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
-                                  n_agent_outputs=cfg.curiosity.encoding_size,
-                                  n_agents=env.n_agents,
-                                  centralised=True,
-                                  share_params=True,
-                                  device=cfg.train.device)
+    # Curiosity
+    curiosity_transform, loss_curiosity = build_curiosity(env, cfg)
 
-    forward_model = MultiAgentMLP(n_agent_inputs=cfg.curiosity.encoding_size + env.action_spec.shape[-1],
-                                  n_agent_outputs=cfg.curiosity.encoding_size,
-                                  n_agents=env.n_agents,
-                                  centralised=True,
-                                  share_params=True,
-                                  device=cfg.train.device)
-    
-    inverse_model = MultiAgentMLP(n_agent_inputs=cfg.curiosity.encoding_size * 2,
-                                  n_agent_outputs=env.action_spec.shape[-1],
-                                  n_agents=env.n_agents,
-                                  centralised=True,
-                                  share_params=True,
-                                  device=cfg.train.device)
-    inverse_model = InverseModel(feature_network=feature_model,
-                                 inverse_network=inverse_model) 
 
     env = TransformedEnv(
         env,
         Compose(
-            IntrinsicCuriosityReward(
-                forward_model=forward_model,
-                feature_model=feature_model,
-                encoding_size=cfg.curiosity.encoding_size,
-                n_agents=env.n_agents,
-                reward_key=env.reward_key,
-                action_key=env.action_key,
-                observation_key=("agents","observation"),
-                weighting = cfg.curiosity.weighting
-            ),
+            curiosity_transform,
             RewardSum(
-                in_keys=[env.reward_key],
-                out_keys=[("agents","episode_reward")]
-            )
+                in_keys=env.reward_key,
+                out_keys=["episode_reward"]
+            ),
+            NoopResetEnv(2)
         )
     )
-    # Policy
-    policy_network = MultiAgentMLP(n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
-                                   n_agent_outputs=env.action_spec.shape[-1],
-                                   n_agents=env.n_agents,
-                                   centralised=cfg.model.centralised,
-                                   share_params=cfg.model.shared_parameters,
-                                   device=cfg.train.device,
-                                   depth=cfg.model.depth,
-                                   num_cells=cfg.model.num_cell
-    )
-    policy_module = TensorDictModule(policy_network,
-                                     in_keys=[("agents", "observation")],
-                                     out_keys=[("agents", "param")]
-    )
 
-    policy = ProbabilisticActor(module=policy_module,
-                                spec=env.unbatched_action_spec,
-                                in_keys=[("agents", "param")],
-                                out_keys=[env.action_key],
-                                distribution_class = TanhDelta,
-                                distribution_kwargs={
-                                    "min": env.unbatched_action_spec[("agents", "action")].space.minimum,
-                                    "max": env.unbatched_action_spec[("agents", "action")].space.maximum
-                                },
-                                return_log_prob=False
-    )
+    # Create Models
+        # TODO: Pixels
+    policy_module, value_module = build_models(env, cfg)
+    policy_module(env.reset(seed=cfg.seed))
+    value_module(env_eval.reset(seed=cfg.seed))
 
-    exploration_module = AdditiveGaussianWrapper(
-        policy,
-        annealing_num_steps=int(cfg.collector.total_frames * 0.5),
-        action_key=env.action_key
-    )
-
-    # Critic
-    critic_network = MultiAgentMLP(n_agent_inputs=env.observation_spec[("agents", "observation")].shape[-1]
-                                        + env.action_spec.shape[-1], # Q critic
-                                   n_agent_outputs=1,
-                                   n_agents=env.n_agents,
-                                   centralised=cfg.model.centralised,
-                                   share_params=cfg.model.shared_parameters,
-                                   device=cfg.train.device,
-                                   depth=cfg.model.depth,
-                                   num_cells=cfg.model.num_cell
-    )
-    
-    value_module = ValueOperator(module=critic_network,
-                                 in_keys=[("agents", "observation"), env.action_key],
-                                 out_keys=[("agents","state_action_value")]
-    )
-
+    # check_env_specs(env)
     # Data
-    collector = SyncDataCollector(env,
-                                  exploration_module,
-                                  device=cfg.env.device,
-                                  storing_device = cfg.train.device,
-                                  frames_per_batch=cfg.collector.frames_per_batch,
-                                  total_frames=cfg.collector.total_frames
+    collector = SyncDataCollector(
+        env,
+        policy_module,
+        device=cfg.train.device,
+        storing_device="cpu",
+        frames_per_batch=cfg.collector.frames_per_batch,
+        total_frames=cfg.collector.total_frames
     )
 
-    replay_buffer = TensorDictReplayBuffer(storage=LazyTensorStorage(max_size=cfg.buffer.memory_size,
-                                                                     device=cfg.train.device),
-                                           sampler=SamplerWithoutReplacement(),
-                                           batch_size=cfg.train.minibatch_size
+    replay_buffer = TensorDictReplayBuffer(
+        storage=LazyTensorStorage(
+            max_size=cfg.buffer.memory_size,
+            device=cfg.train.device
+        ),
+        sampler=SamplerWithoutReplacement(),
+        batch_size=cfg.train.minibatch_size
     )
 
-    
-    # Train
-    loss_module = DDPGLoss(actor_network=policy,
-                           value_network=value_module
+    # Loss
+    advantage_module = GAE(
+        gamma=cfg.loss.gamma,
+        lmbda=cfg.loss.lmbda,
+        value_network=value_module,
+        average_gae=True
     )
-    loss_module.set_keys(state_action_value=("agents", "state_action_value"),
-                         reward=env.reward_key)
-    loss_module.make_value_estimator(ValueEstimators.TD0, gamma=cfg.loss.gamma)
-    
-    loss_curiosity = IntrinsicCuriosityLoss(forward_model=forward_model,
-                                            inverse_model=inverse_model,
-                                            feature_model=feature_model)
-    
-    optim = torch.optim.Adam(loss_module.parameters(), cfg.train.lr)
-    optim_curiosity = torch.optim.Adam(loss_curiosity.parameters(), cfg.train.lr)
+    loss_module = ClipPPOLoss(
+        actor=policy_module,
+        critic=value_module,
+        normalize_advantage=True
+    )
+
+    # Optimizers
+    optim = Adam(loss_module.parameters(), cfg.train.lr, weight_decay=cfg.train.decay)
+    optim_curiosity = Adam(loss_curiosity.parameters(), cfg.train.lr, weight_decay=cfg.train.decay)
 
     # Logging
     if cfg.logger.enable:
         model_name = "Testing-MADDPG"
-        logger = get_logger(experiment_name=generate_exp_name(cfg.env.scenario_name, model_name),
+        logger = get_logger(experiment_name=generate_exp_name(cfg.env.env_name, model_name),
                             logger_name="logs",
                             logger_type=cfg.logger.backend
         )
 
-    # Training Loop
-    print("Initialization complete. Begin training.")
-
+    # Training loop
     for i, tensordict_data in tqdm(enumerate(collector)):
-        tensordict_data.set(key=("next","done"),
-                            item=tensordict_data.get(("next", "done"))
-                            .unsqueeze(-1)
-                            .expand(tensordict_data.get(("next", env.reward_key)).shape)
-        )
+        replay_buffer.extend(tensordict_data)
 
-        data_view = tensordict_data.reshape(-1)
-        replay_buffer.extend(data_view)
-
+        loss = []
+        loss_c = []
         for _ in range(cfg.train.num_epochs):
+            # GAE
+            with torch.no_grad():
+                tensordict_data = advantage_module(tensordict_data.to(cfg.train.device)).cpu()
+            data_reshape = tensordict_data.reshape(-1)
+            replay_buffer.extend(data_reshape)
+
             for _ in range(cfg.collector.frames_per_batch // cfg.train.minibatch_size):
                 # Sample
                 minibatch = replay_buffer.sample()
 
-                # Calculate Loss
+                # Loss
                 loss_values = loss_module(minibatch)
-                loss_value = loss_values["loss_actor"] + loss_values["loss_value"]
+                loss_value = loss_values['loss_critic'] + loss_values['loss_entropy'] + loss_values['loss_objective']
                 loss_value.backward()
+                loss.append(loss_value.item())
 
                 loss_curiosity_values = loss_curiosity(minibatch)
-                loss_curiosity_values = loss_curiosity_values["loss_forward"] + loss_curiosity_values["loss_inverse"]
-                loss_curiosity_values.backward()
-                # Keep gradient norm bounded
-                torch.nn.utils.clip_grad_norm_(loss_module.parameters(), cfg.train.max_grad_norm)
+                loss_curiosity_value = loss_curiosity_values['loss_inverse'] + loss_curiosity_values['loss_forward']
+                loss_curiosity_value.backward()
+                loss_c.append(loss_curiosity_value.item())
+
 
                 # Step
                 optim.step()
@@ -221,21 +299,27 @@ def train(cfg: "DictConfig"):
                 optim_curiosity.step()
                 optim_curiosity.zero_grad()
 
+        if cfg.logger.enable:
+            log_training(
+                cfg, logger,
+                tensordict_data, sum(loss) / len(loss), sum(loss_c) / len(loss_c), i,
+            )
+    
         # Logging
         if cfg.logger.enable and i % cfg.eval.evaluation_interval == 0:
-            with torch.no_grad() and set_exploration_type(ExplorationType.MEAN):
+            with torch.no_grad() and set_exploration_type(ExplorationType.MODE):
                 env_eval.frames = []
                 rollouts = env_eval.rollout(max_steps=cfg.env.max_steps,
-                                            policy=policy,
+                                            policy=policy_module,
                                             callback=rendering_callback,
                                             auto_cast_to_device=True,
                                             break_when_any_done=False
                 )
-                log_evaluation(logger, rollouts, env_eval, loss_value, i)
+                log_evaluation(cfg, logger, rollouts, env_eval, loss_value, i)
 
 
 def rendering_callback(env, td):
-    env.frames.append(env.render(mode="rgb_array", agent_index_focus=None))
+    env.frames.append(env.render())
 
 if __name__=="__main__":
     train()

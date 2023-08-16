@@ -9,10 +9,10 @@ env:
   num_envs: ???
 
 model:
-  shared_parameters: False
-  centralised: True
-  depth: 2
-  num_cell: 64
+  shared_parameters: True
+  centralised: False
+  depth: 3
+  num_cell: 129
 
 collector:
   frames_per_batch: 60_000 # Frames sampled each sampling iteration
@@ -27,8 +27,8 @@ loss:
   tau: 0.005 # For target net
 
 curiosity:
-  encoding_size: 8
-  weighting: 1
+  encoding_size: 16
+  weighting: 0.1
 
 train:
   num_epochs: 45  # optimization steps per batch of data collected
@@ -42,5 +42,5 @@ eval:
   evaluation_episodes: 200
 
 logger:
-  enable: False
+  enable: True
   backend:  wandb 

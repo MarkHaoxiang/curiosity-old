@@ -1,0 +1,44 @@
+seed: 0
+
+env:
+  max_steps: 100
+  frame_skip: 1 
+  env_name: "Pendulum"
+  from_pixels: False
+
+model:
+  depth: 3
+  num_cell: 128
+
+collector:
+  frames_per_batch: 4096
+   # Frames sampled each sampling iteration
+  n_iters: 100 # Number of sampling/training iterations
+  total_frames: ???
+
+buffer:
+  memory_size: ???
+
+loss:
+  gamma: 0.99
+  lmbda: 0.95
+  tau: 0.005 # For target net
+
+curiosity:
+  encoding_size: 32
+  weighting: 0.5
+
+train:
+  num_epochs: 45  # optimization steps per batch of data collected
+  minibatch_size: 512 # size of minibatches used in each epoch
+  lr: 0.0001
+  decay: 0.0 
+  device: ???
+
+eval:
+  evaluation_interval: 20
+  evaluation_episodes: 200
+
+logger:
+  enable: True
+  backend:  wandb 
