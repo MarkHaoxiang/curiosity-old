@@ -44,7 +44,7 @@ def log_evaluation(
     evaluation_time: float,
     step: int,
 ):
-    reward = rollout.get(("next", "reward")).mean()
+    reward = rollout.get(("next", "reward")).sum()
     to_log = {
         "eval/episode_reward": reward / cfg.env.frame_skip,
         "eval/episode_len": len(rollout),
@@ -74,8 +74,10 @@ def log_training(
     loss_curiosity: float,
     step: int
 ):
-    reward = training_td.get(("next", "reward")).mean() / cfg.env.frame_skip
+    intrinsic_reward = training_td.get(("next", "icm", "r_i")).sum() / cfg.env.frame_skip
+    extrinsic_reward = training_td.get(("next", "icm", "r_e")).sum() / cfg.env.frame_skip
     logger.log_scalar("train/loss", loss / cfg.env.frame_skip)
     logger.log_scalar("train/loss_curiosity", loss_curiosity / cfg.env.frame_skip)
-    logger.log_scalar("train/reward", reward / cfg.env.frame_skip)
+    logger.log_scalar("train/intrinsic_reward", intrinsic_reward / cfg.env.frame_skip)
+    logger.log_scalar("train/extrinsic_reward", extrinsic_reward / cfg.env.frame_skip)
     logger.log_scalar("train/step", step)

@@ -23,9 +23,9 @@ from torchrl.envs import (
     TransformedEnv,
     Compose,
     RewardSum,
-    NoopResetEnv,
     ExplorationType,
     set_exploration_type,
+    DoubleToFloat,
     check_env_specs
 )
 from torchrl.modules import (
@@ -38,7 +38,7 @@ from torchrl.modules import (
 )
 from tqdm import tqdm
 
-from models.ICM import IntrinsicCuriosityLoss, IntrinsicCuriosityReward, InverseModel
+from models.ICM import IntrinsicCuriosityModule
 from utils.logging import log_evaluation, log_training
 
 def build_curiosity(env, cfg):
@@ -61,7 +61,6 @@ def build_curiosity(env, cfg):
         device=cfg.train.device        
     )
 
-
     inverse_head = MLP(
         in_features=cfg.curiosity.encoding_size * 2,
         depth=cfg.model.depth // 2,
@@ -69,28 +68,16 @@ def build_curiosity(env, cfg):
         device=cfg.train.device
     )
 
-    inverse_net = InverseModel(
-        feature_network=feature_net,
-        inverse_network=inverse_head
+    icm = IntrinsicCuriosityModule(
+        feature_net=feature_net,
+        inverse_net=inverse_head,
+        forward_net=forward_net,
+        eta=cfg.curiosity.eta,
+        beta=cfg.curiosity.beta,
+        only_intrinsic_reward=cfg.curiosity.intrinsic_only
     )
 
-    curiosity_transform = IntrinsicCuriosityReward(
-        forward_model=forward_net,
-        feature_model=feature_net,
-        encoding_size=cfg.curiosity.encoding_size,
-        multiagent=False,
-        reward_key=env.reward_key,
-        action_key=env.action_key,
-        weighting=cfg.curiosity.weighting
-    )
-
-    curiosity_loss = IntrinsicCuriosityLoss(
-        forward_model=forward_net,
-        inverse_model=inverse_net,
-        feature_model=feature_net
-    )
-
-    return curiosity_transform, curiosity_loss
+    return icm
 
 def build_models(env, cfg):
     n_features = env.observation_spec['observation'].shape[0]
@@ -194,23 +181,27 @@ def train(cfg: "DictConfig"):
     cfg.buffer.memory_size = cfg.collector.frames_per_batch = cfg.collector.frames_per_batch // cfg.env.frame_skip
 
     # Create env and test
-    env = GymEnv(env_name=cfg.env.env_name, frame_skip=cfg.env.frame_skip, device=cfg.train.device)
-    env_eval = GymEnv(env_name=cfg.env.env_name, frame_skip=cfg.env.frame_skip, device=cfg.train.device, render_mode='rgb_array')
+    env = GymEnv(env_name=cfg.env.env_name, frame_skip=cfg.env.frame_skip, device=cfg.train.device, **cfg.env.kwargs)
+    env_eval = GymEnv(env_name=cfg.env.env_name, frame_skip=cfg.env.frame_skip, device=cfg.train.device, render_mode='rgb_array', **cfg.env.kwargs)
     
     # Curiosity
-    curiosity_transform, loss_curiosity = build_curiosity(env, cfg)
-
+    icm = build_curiosity(env, cfg)
 
     env = TransformedEnv(
         env,
         Compose(
-            curiosity_transform,
+            DoubleToFloat(in_keys=['observation']),
             RewardSum(
                 in_keys=env.reward_key,
                 out_keys=["episode_reward"]
             ),
-            NoopResetEnv(2)
+            icm
         )
+    )
+
+    env_eval = TransformedEnv(
+        env_eval,
+        DoubleToFloat(in_keys=['observation'])
     )
 
     # Create Models
@@ -219,7 +210,10 @@ def train(cfg: "DictConfig"):
     policy_module(env.reset(seed=cfg.seed))
     value_module(env_eval.reset(seed=cfg.seed))
 
-    # check_env_specs(env)
+    check_env_specs(env)
+    
+    test = env.rollout(1)
+
     # Data
     collector = SyncDataCollector(
         env,
@@ -254,11 +248,11 @@ def train(cfg: "DictConfig"):
 
     # Optimizers
     optim = Adam(loss_module.parameters(), cfg.train.lr, weight_decay=cfg.train.decay)
-    optim_curiosity = Adam(loss_curiosity.parameters(), cfg.train.lr, weight_decay=cfg.train.decay)
+    optim_curiosity = Adam(icm.loss_module.parameters(), cfg.train.lr, weight_decay=cfg.train.decay)
 
     # Logging
     if cfg.logger.enable:
-        model_name = "Testing-MADDPG"
+        model_name = "Testing-PPO"
         logger = get_logger(experiment_name=generate_exp_name(cfg.env.env_name, model_name),
                             logger_name="logs",
                             logger_type=cfg.logger.backend
@@ -287,11 +281,10 @@ def train(cfg: "DictConfig"):
                 loss_value.backward()
                 loss.append(loss_value.item())
 
-                loss_curiosity_values = loss_curiosity(minibatch)
+                loss_curiosity_values = icm.loss_module(minibatch)
                 loss_curiosity_value = loss_curiosity_values['loss_inverse'] + loss_curiosity_values['loss_forward']
                 loss_curiosity_value.backward()
                 loss_c.append(loss_curiosity_value.item())
-
 
                 # Step
                 optim.step()

@@ -1,19 +1,21 @@
 seed: 0
 
 env:
-  max_steps: 100
-  frame_skip: 1 
-  env_name: "Pendulum"
+  max_steps: 1000
+  frame_skip: 1
+  env_name: "Ant-v4"
   from_pixels: False
+  kwargs:
+    terminate_when_unhealthy: True
 
 model:
   depth: 3
   num_cell: 128
 
 collector:
-  frames_per_batch: 4096
+  frames_per_batch: 2048
    # Frames sampled each sampling iteration
-  n_iters: 100 # Number of sampling/training iterations
+  n_iters: 500 # Number of sampling/training iterations
   total_frames: ???
 
 buffer:
@@ -25,12 +27,14 @@ loss:
   tau: 0.005 # For target net
 
 curiosity:
-  encoding_size: 32
-  weighting: 0.5
+  encoding_size: 64
+  beta: 0.2
+  eta: 0.05
+  intrinsic_only: False
 
 train:
-  num_epochs: 45  # optimization steps per batch of data collected
-  minibatch_size: 512 # size of minibatches used in each epoch
+  num_epochs: 30  # optimization steps per batch of data collected
+  minibatch_size: 256 # size of minibatches used in each epoch
   lr: 0.0001
   decay: 0.0 
   device: ???
