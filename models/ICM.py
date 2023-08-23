@@ -45,10 +45,12 @@ class IntrinsicCuriosityModule(Transform):
         self._only_intrinsic_reward = only_intrinsic_reward
 
         self._previous_state = None
-
-        self.loss_module = IntrinsicCuriosityLoss(feature_net, forward_net, self._inverse_net, action_key=action_key, beta=beta)  
+        self._icm_observation_spec = None
+        self.loss_module = IntrinsicCuriosityLoss(feature_net, forward_net, self._inverse_net, action_key=action_key, beta=beta)
 
     def reset(self, tensordict: TensorDictBase) -> TensorDictBase:
+        if self._icm_observation_spec is None:
+            self.transform_observation_spec(self.parent.observation_spec)
         self._previous_state = tensordict
         tensordict.set("icm", self._icm_observation_spec.zero(tensordict.shape))
         return tensordict

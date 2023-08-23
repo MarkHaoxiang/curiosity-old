@@ -1,11 +1,10 @@
 seed: 0
 
 env:
-  max_steps: 400
+  max_steps: 500
   frame_skip: 1
-  env_name: "ALE/Pong-v5"
-  from_pixels: True
-  observation_key: ???
+  env_name: "MountainCarContinuous-v0"
+  from_pixels: False
   # kwargs:
     # terminate_when_unhealthy: True
 
@@ -14,9 +13,9 @@ model:
   num_cell: 128
 
 collector:
-  frames_per_batch: 256
+  frames_per_batch: 2048
    # Frames sampled each sampling iteration
-  n_iters: 2000 # Number of sampling/training iterations
+  n_iters: 500 # Number of sampling/training iterations
   total_frames: ???
 
 buffer:
@@ -34,15 +33,15 @@ curiosity:
   intrinsic_only: True
 
 train:
-  num_epochs: 64  # optimization steps per batch of data collected
-  minibatch_size: 16 # size of minibatches used in each epoch
+  num_epochs: 30  # optimization steps per batch of data collected
+  minibatch_size: 256 # size of minibatches used in each epoch
   lr: 0.0001
   decay: 0.0 
   device: ???
 
 eval:
   evaluation_interval: 20
-  evaluation_episodes: 64
+  evaluation_episodes: 200
 
 logger:
   enable: True
